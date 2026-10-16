@@ -1,85 +1,120 @@
+import os
 import time
-from collections import defaultdict
-from typing import Dict
 import uuid
+from collections import deque
+from threading import Lock
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
+
+
+# Configuration
+EMAIL = os.getenv(
+    "EXAM_EMAIL",
+    "23f2003924@ds.study.iitm.ac.in",
+)
+
+ASSIGNED_ORIGIN = "https://app-52d3te.example.com"
+EXAM_PAGE_ORIGIN = os.getenv("EXAM_PAGE_ORIGIN")
+
+ALLOWED_ORIGINS = [ASSIGNED_ORIGIN]
+
+if EXAM_PAGE_ORIGIN and EXAM_PAGE_ORIGIN not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.append(EXAM_PAGE_ORIGIN)
 
 app = FastAPI()
 
-# --- CORS Middleware (Built-in FastAPI CORSMiddleware) ---
-# Allows your assigned origin plus automated test/exam runner domains via regex
+
+# 1. Request context middleware
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID")
+
+        if not request_id:
+            request_id = str(uuid.uuid4())
+
+        request.state.request_id = request_id
+
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+
+        return response
+
+
+# 2. Per-client rate limiting middleware
+class ClientRateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, limit=10, window_seconds=10):
+        super().__init__(app)
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.buckets = {}
+        self.lock = Lock()
+
+    async def dispatch(self, request: Request, call_next):
+        client_id = request.headers.get("X-Client-Id", "anonymous")
+        now = time.monotonic()
+
+        with self.lock:
+            bucket = self.buckets.setdefault(client_id, deque())
+
+            # Remove requests outside the rolling time window.
+            while bucket and now - bucket[0] >= self.window_seconds:
+                bucket.popleft()
+
+            # Reject requests exceeding the limit.
+            if len(bucket) >= self.limit:
+                response = JSONResponse(
+                    {"detail": "Rate limit exceeded"},
+                    status_code=429,
+                )
+
+                request_id = getattr(request.state, "request_id", None)
+                if request_id:
+                    response.headers["X-Request-ID"] = request_id
+
+                return response
+
+            bucket.append(now)
+
+        return await call_next(request)
+
+
+# 3. Register middleware
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://app-52d3te.example.com",
-    ],
-    allow_origin_regex=(
-        r"https://.*\.onrender\.com|https://.*\.example\.com|https://.*\.eval\..*"
-    ),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    ClientRateLimitMiddleware,
+    limit=10,
+    window_seconds=10,
 )
 
-# --- Configuration for Rate Limiting & Context ---
-RATE_LIMIT_BUCKET_SIZE = 10
-RATE_LIMIT_WINDOW = 10  # seconds
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=[
+        "X-Request-ID",
+        "X-Client-Id",
+        "Content-Type",
+    ],
+    expose_headers=["X-Request-ID"],
+    max_age=600,
+)
 
-rate_limit_store: Dict[str, list] = defaultdict(list)
-
-
-# --- Middleware 1: Request Context ---
-class RequestContextMiddleware(BaseHTTPMiddleware):
-
-  async def dispatch(self, request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
-      request_id = str(uuid.uuid4())
-
-    request.state.request_id = request_id
-
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
-
-# --- Middleware 3: Per-Client Rate Limiting ---
-class RateLimitMiddleware(BaseHTTPMiddleware):
-
-  async def dispatch(self, request: Request, call_next):
-    if request.url.path == "/ping":
-      client_id = request.headers.get("X-Client-Id")
-      if client_id:
-        now = time.time()
-        timestamps = rate_limit_store[client_id]
-
-        # Prune timestamps outside the 10-second window
-        timestamps[:] = [
-            t for t in timestamps if now - t < RATE_LIMIT_WINDOW
-        ]
-
-        if len(timestamps) >= RATE_LIMIT_BUCKET_SIZE:
-          return JSONResponse(
-              status_code=429,
-              content={"detail": "Rate limit exceeded. Too many requests."},
-          )
-
-        timestamps.append(now)
-
-    response = await call_next(request)
-    return response
-
-
-# Register custom middlewares (executed bottom-up)
-app.add_middleware(RateLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
 
 
+# 4. Health-check endpoint
 @app.get("/ping")
 async def ping(request: Request):
-  request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-  return {"email": "user@example.com", "request_id": request_id}
+    return {
+        "email": EMAIL,
+        "request_id": request.state.request_id,
+    }
+
+
+# 5. CORS preflight endpoint
+@app.options("/ping")
+async def ping_options():
+    return Response(status_code=204)
